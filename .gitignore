@@ -1,0 +1,13 @@
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+__pycache__/
+*.pyc
+.DS_Store
+
+FE/.next/
+FE/node_modules/
+FE/dist/
+FE/build/

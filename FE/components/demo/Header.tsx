@@ -17,16 +17,16 @@ export default function Header() {
           </span>
         </div>
         <h1 className="text-4xl md:text-5xl font-bold tracking-tight mb-3">
-          Image Manipulation
-          <span className="block text-sky-200">Localization Demo</span>
+          Abnormal Region
+          <span className="block text-sky-200">Detection In Artworks</span>
         </h1>
         <p className="text-blue-100 text-lg mb-6 max-w-2xl leading-relaxed">
-          Visualizing AI-based manipulated region detection with deep learning segmentation models.
+          Visualizing manipulated region detection with deep learning segmentation models.
         </p>
         <div className="inline-flex items-center gap-2 bg-white/15 backdrop-blur-sm border border-white/25 rounded-full px-4 py-2">
           <Layers className="w-4 h-4 text-sky-200" />
           <span className="text-sm font-medium text-white">
-            U-Net++ ResNet34 + High-Frequency Input + CBAM
+            U-Net++ ResNet34 + High-Frequency Input + CBAM + EMA
           </span>
         </div>
       </div>
