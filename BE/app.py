@@ -6,7 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from torchvision import transforms
@@ -17,36 +18,19 @@ import segmentation_models_pytorch as smp
 # CONFIG
 # =========================
 
-MODEL_PATH = "hcunet.pth"
+MODEL_PATHS = {
+    "hcunetpp": "hcunet.pth",
+    "unetpp": "unetplus_baseline.pth",
+}
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
 
-checkpoint = torch.load(MODEL_PATH, map_location=device)
-
-if "model_state_dict" not in checkpoint:
-    raise ValueError("File .pth không đúng format, cần có key model_state_dict")
-
-TRAIN_SIZE = checkpoint.get("train_size", 384)
-
-DEFAULT_MASK_THRESHOLD = checkpoint.get(
-    "best_mask_threshold",
-    checkpoint.get("best_threshold", 0.35)
-)
-
-USE_HIGH_FREQ = checkpoint.get("use_high_frequency", True)
-HIGH_FREQ_KERNEL = checkpoint.get("high_freq_kernel", 5)
-HIGH_FREQ_SCALE = checkpoint.get("high_freq_scale", 1.0)
-
-IN_CHANNELS = checkpoint.get(
-    "in_channels",
-    6 if USE_HIGH_FREQ else 3
-)
-
-USE_BOTTLENECK_CBAM = checkpoint.get("use_bottleneck_cbam", True)
-USE_DECODER_CBAM = checkpoint.get("use_decoder_cbam", False)
-
-CBAM_REDUCTION = checkpoint.get("cbam_reduction", 16)
-CBAM_SPATIAL_KERNEL = checkpoint.get("cbam_spatial_kernel", 7)
+print("Device:", device)
 
 MIN_AREA_RATIO = 0.0015
 CLOSE_KERNEL = 3
@@ -56,7 +40,7 @@ CLOSE_KERNEL = 3
 # HIGH-FREQUENCY INPUT
 # =========================
 
-def make_high_frequency(x, kernel_size=HIGH_FREQ_KERNEL):
+def make_high_frequency(x, kernel_size=5, scale=1.0):
     pad = kernel_size // 2
 
     x_pad = F.pad(
@@ -72,17 +56,20 @@ def make_high_frequency(x, kernel_size=HIGH_FREQ_KERNEL):
         padding=0
     )
 
-    high = (x - blur) * HIGH_FREQ_SCALE
+    high = (x - blur) * scale
     return high
 
 
-def make_model_input(img):
-    if USE_HIGH_FREQ:
-        high = make_high_frequency(img)
+def make_model_input(img, model_info):
+    if model_info["use_high_frequency"]:
+        high = make_high_frequency(
+            img,
+            kernel_size=model_info["high_freq_kernel"],
+            scale=model_info["high_freq_scale"]
+        )
         return torch.cat([img, high], dim=1)
 
     return img
-
 
 # =========================
 # CBAM MODULE
@@ -169,7 +156,10 @@ class UnetPlusPlusHighFreqCBAMSegOnly(nn.Module):
         in_channels=6,
         classes=1,
         use_bottleneck_cbam=True,
-        use_decoder_cbam=False
+        use_decoder_cbam=False,
+        cbam_reduction=16,
+        cbam_spatial_kernel=7
+        
     ):
         super().__init__()
 
@@ -187,8 +177,8 @@ class UnetPlusPlusHighFreqCBAMSegOnly(nn.Module):
         if use_bottleneck_cbam:
             self.bottleneck_cbam = CBAM(
                 bottleneck_channels,
-                reduction=CBAM_REDUCTION,
-                spatial_kernel=CBAM_SPATIAL_KERNEL
+                reduction=cbam_reduction,
+                spatial_kernel=cbam_spatial_kernel
             )
         else:
             self.bottleneck_cbam = nn.Identity()
@@ -197,9 +187,9 @@ class UnetPlusPlusHighFreqCBAMSegOnly(nn.Module):
 
         if use_decoder_cbam:
             self.decoder_cbam = CBAM(
-                decoder_out_channels,
-                reduction=CBAM_REDUCTION,
-                spatial_kernel=CBAM_SPATIAL_KERNEL
+                    decoder_out_channels,
+                    reduction=cbam_reduction,
+                    spatial_kernel=cbam_spatial_kernel
             )
         else:
             self.decoder_cbam = nn.Identity()
@@ -221,42 +211,148 @@ class UnetPlusPlusHighFreqCBAMSegOnly(nn.Module):
         return mask_logits
 
 
-# =========================
-# LOAD MODEL ONE TIME
-# =========================
 
-model = UnetPlusPlusHighFreqCBAMSegOnly(
-    encoder_name="resnet34",
-    encoder_weights=None,
-    in_channels=IN_CHANNELS,
-    classes=1,
-    use_bottleneck_cbam=USE_BOTTLENECK_CBAM,
-    use_decoder_cbam=USE_DECODER_CBAM
-).to(device)
+#HELPER FUNCTION
 
-state_dict = checkpoint["model_state_dict"]
-state_dict = {
-    k.replace("module.", ""): v
-    for k, v in state_dict.items()
+def clean_state_dict(state_dict):
+    return {
+        k.replace("module.", ""): v
+        for k, v in state_dict.items()
+    }
+
+
+def state_dict_uses_wrapper(state_dict):
+    return any(
+        k.startswith("base.")
+        or k.startswith("bottleneck_cbam.")
+        or k.startswith("decoder_cbam.")
+        for k in state_dict.keys()
+    )
+
+
+def load_model_bundle(model_type, model_path):
+    checkpoint = torch.load(model_path, map_location="cpu")
+
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(f"{model_path} không đúng format, cần có key model_state_dict")
+
+    state_dict = clean_state_dict(checkpoint["model_state_dict"])
+
+    train_size = checkpoint.get("train_size", 384)
+
+    default_threshold = checkpoint.get(
+        "best_mask_threshold",
+        checkpoint.get("best_threshold", 0.35)
+    )
+
+    # HCUNet++ mặc định dùng high-frequency input.
+    # U-Net++ baseline mặc định dùng RGB 3 channels.
+    default_use_high_frequency = model_type == "hcunetpp"
+
+    use_high_frequency = checkpoint.get(
+        "use_high_frequency",
+        default_use_high_frequency
+    )
+
+    high_freq_kernel = checkpoint.get("high_freq_kernel", 5)
+    high_freq_scale = checkpoint.get("high_freq_scale", 1.0)
+
+    in_channels = checkpoint.get(
+        "in_channels",
+        6 if use_high_frequency else 3
+    )
+
+    has_bottleneck_cbam = any(
+        k.startswith("bottleneck_cbam.")
+        for k in state_dict.keys()
+    )
+
+    has_decoder_cbam = any(
+        k.startswith("decoder_cbam.")
+        for k in state_dict.keys()
+    )
+
+    use_bottleneck_cbam = checkpoint.get(
+        "use_bottleneck_cbam",
+        has_bottleneck_cbam
+    )
+
+    use_decoder_cbam = checkpoint.get(
+        "use_decoder_cbam",
+        has_decoder_cbam
+    )
+
+    cbam_reduction = checkpoint.get("cbam_reduction", 16)
+    cbam_spatial_kernel = checkpoint.get("cbam_spatial_kernel", 7)
+
+    uses_wrapper = state_dict_uses_wrapper(state_dict)
+
+    if uses_wrapper:
+        loaded_model = UnetPlusPlusHighFreqCBAMSegOnly(
+            encoder_name="resnet34",
+            encoder_weights=None,
+            in_channels=in_channels,
+            classes=1,
+            use_bottleneck_cbam=use_bottleneck_cbam,
+            use_decoder_cbam=use_decoder_cbam,
+            cbam_reduction=cbam_reduction,
+            cbam_spatial_kernel=cbam_spatial_kernel
+        ).to(device)
+    else:
+        loaded_model = smp.UnetPlusPlus(
+            encoder_name="resnet34",
+            encoder_weights=None,
+            in_channels=in_channels,
+            classes=1,
+            activation=None,
+            aux_params=None
+        ).to(device)
+
+    loaded_model.load_state_dict(state_dict, strict=True)
+    loaded_model.eval()
+
+    model_transform = transforms.Compose([
+        transforms.Resize((train_size, train_size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+
+    return {
+        "model": loaded_model,
+        "path": model_path,
+        "train_size": train_size,
+        "default_threshold": float(default_threshold),
+        "use_high_frequency": bool(use_high_frequency),
+
+        # Baseline U-Net++ không dùng high-frequency nên checkpoint lưu None
+        "high_freq_kernel": int(high_freq_kernel) if high_freq_kernel is not None else None,
+        "high_freq_scale": float(high_freq_scale) if high_freq_scale is not None else None,
+
+        "in_channels": int(in_channels),
+
+        "use_bottleneck_cbam": bool(use_bottleneck_cbam),
+        "use_decoder_cbam": bool(use_decoder_cbam),
+
+        # Baseline U-Net++ không dùng CBAM nên checkpoint lưu None
+        "cbam_reduction": int(cbam_reduction) if cbam_reduction is not None else None,
+        "cbam_spatial_kernel": int(cbam_spatial_kernel) if cbam_spatial_kernel is not None else None,
+
+        "transform": model_transform,
+    }
+
+
+MODEL_BUNDLES = {
+    model_type: load_model_bundle(model_type, model_path)
+    for model_type, model_path in MODEL_PATHS.items()
 }
-
-model.load_state_dict(state_dict, strict=True)
-model.eval()
-
-transform = transforms.Compose([
-    transforms.Resize((TRAIN_SIZE, TRAIN_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-])
-
 
 # =========================
 # HELPER FUNCTIONS
 # =========================
 
-def forward_model(model, img):
-    x = make_model_input(img)
-    return model(x)
+def forward_model(model_info, img):
+    x = make_model_input(img, model_info)
+    return model_info["model"](x)
 
 
 def pil_to_base64_png(img_pil):
@@ -265,18 +361,57 @@ def pil_to_base64_png(img_pil):
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-def make_overlay(img_pil, mask_pil, alpha=0.45):
-    img_np = np.array(img_pil).astype(np.float32)
-    mask_np = np.array(mask_pil) > 0
+def make_overlay(img_pil, mask_pil, alpha=0.45, overlay_mode="fill"):
+    img_np = np.array(img_pil.convert("RGB")).astype(np.uint8)
+    mask_np = (np.array(mask_pil.convert("L")) > 0).astype(np.uint8)
 
     overlay = img_np.copy()
 
-    red = np.zeros_like(img_np)
+    if overlay_mode == "contour":
+        contours, _ = cv2.findContours(
+            mask_np,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        if len(contours) > 0:
+            # Viền trắng bên ngoài để nổi trên nền tối/sáng
+            cv2.drawContours(
+                overlay,
+                contours,
+                -1,
+                (255, 255, 255),
+                thickness=6,
+                lineType=cv2.LINE_AA
+            )
+
+            # Viền đỏ chính
+            cv2.drawContours(
+                overlay,
+                contours,
+                -1,
+                (255, 0, 0),
+                thickness=3,
+                lineType=cv2.LINE_AA
+            )
+
+        return Image.fromarray(overlay)
+
+    # Default: fill red region for inpaint
+    img_float = img_np.astype(np.float32)
+
+    red = np.zeros_like(img_float)
     red[:, :, 0] = 255
 
-    overlay[mask_np] = img_np[mask_np] * (1 - alpha) + red[mask_np] * alpha
+    mask_bool = mask_np > 0
 
-    return Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8))
+    img_float[mask_bool] = (
+        img_float[mask_bool] * (1 - alpha)
+        + red[mask_bool] * alpha
+    )
+
+    return Image.fromarray(np.clip(img_float, 0, 255).astype(np.uint8))
+
 
 
 def clean_prediction_mask(mask_pil, min_area_ratio=0.0015, close_kernel=3):
@@ -303,16 +438,23 @@ def clean_prediction_mask(mask_pil, min_area_ratio=0.0015, close_kernel=3):
 
     return Image.fromarray((cleaned * 255).astype(np.uint8))
 
-
-def predict_one_image(img_pil, threshold, use_postprocess):
+    
+def predict_one_image(
+    img_pil,
+    threshold,
+    use_postprocess,
+    overlay_mode="fill",
+    model_type="hcunetpp"
+):
+    model_info = MODEL_BUNDLES[model_type]
     img_pil = img_pil.convert("RGB")
     orig_w, orig_h = img_pil.size
 
-    x = transform(img_pil).unsqueeze(0).to(device)
+    x = model_info["transform"](img_pil).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        mask_logits = forward_model(model, x)
-        prob_small = torch.sigmoid(mask_logits)[0, 0].detach().cpu().numpy()
+        mask_logits = forward_model(model_info, x)
+    prob_small = torch.sigmoid(mask_logits)[0, 0].detach().cpu().numpy()
 
     prob_orig = cv2.resize(
         prob_small,
@@ -339,7 +481,11 @@ def predict_one_image(img_pil, threshold, use_postprocess):
             close_kernel=CLOSE_KERNEL
         )
 
-    overlay_img = make_overlay(img_pil, mask_img)
+    overlay_img = make_overlay(
+        img_pil,
+        mask_img,
+        overlay_mode=overlay_mode
+    )
 
     mask_np = np.array(mask_img) > 0
     pred_area_ratio = float(mask_np.mean())
@@ -353,8 +499,10 @@ def predict_one_image(img_pil, threshold, use_postprocess):
         "raw_prob_mean": raw_prob_mean,
         "raw_prob_max": raw_prob_max,
         "pred_area_ratio": pred_area_ratio,
-        "train_size": TRAIN_SIZE,
-        "default_threshold_from_checkpoint": float(DEFAULT_MASK_THRESHOLD),
+        "model_type": model_type,
+        "model_path": model_info["path"],
+        "train_size": model_info["train_size"],
+        "default_threshold_from_checkpoint": float(model_info["default_threshold"]),
         "device": device,
     }
 
@@ -377,26 +525,56 @@ app.add_middleware(
 @app.get("/")
 def health_check():
     return {
-        "message": "HCUNet++ backend is running",
+        "message": "Detection backend is running",
         "device": device,
-        "train_size": TRAIN_SIZE,
-        "default_threshold": float(DEFAULT_MASK_THRESHOLD),
+        "available_models": {
+            model_type: {
+                "path": info["path"],
+                "train_size": info["train_size"],
+                "default_threshold": info["default_threshold"],
+                "in_channels": info["in_channels"],
+                "use_high_frequency": info["use_high_frequency"],
+                "use_bottleneck_cbam": info["use_bottleneck_cbam"],
+                "use_decoder_cbam": info["use_decoder_cbam"],
+            }
+            for model_type, info in MODEL_BUNDLES.items()
+        }
     }
 
 
 @app.post("/predict")
 async def predict(
     file: UploadFile = File(...),
-    threshold: float = Form(DEFAULT_MASK_THRESHOLD),
-    use_postprocess: bool = Form(False)
+    threshold: Optional[float] = Form(None),
+    use_postprocess: bool = Form(False),
+    overlay_mode: str = Form("fill"),
+    model_type: str = Form("hcunetpp")
 ):
     image_bytes = await file.read()
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
+    model_type = model_type.lower().strip()
+
+    if model_type not in MODEL_BUNDLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid model_type: {model_type}. Use one of: {list(MODEL_BUNDLES.keys())}"
+        )
+
+    if threshold is None:
+        threshold = MODEL_BUNDLES[model_type]["default_threshold"]
+
+    overlay_mode = overlay_mode.lower().strip()
+
+    if overlay_mode not in ["fill", "contour"]:
+        overlay_mode = "fill"
+
     result = predict_one_image(
         img_pil=img,
         threshold=threshold,
-        use_postprocess=use_postprocess
+        use_postprocess=use_postprocess,
+        overlay_mode=overlay_mode,
+        model_type=model_type
     )
 
     return result

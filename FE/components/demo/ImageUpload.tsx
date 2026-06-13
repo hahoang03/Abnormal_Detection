@@ -99,7 +99,7 @@ export default function ImageUpload({
             />
           </div>
         ) : (
-          <div className="flex flex-col items-center justify-center py-16 px-6 text-center">
+          <div className="flex flex-col items-center justify-center py-10 px-6 text-center">
             <div
               className={`p-4 rounded-2xl mb-4 transition-colors ${
                 isDragging ? 'bg-blue-100' : 'bg-blue-50'
